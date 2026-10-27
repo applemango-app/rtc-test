@@ -18,7 +18,7 @@
   button:disabled { opacity:.4; cursor:default; }
   input { font:inherit; padding:9px 10px; border:1px solid var(--line); border-radius:8px; flex:1; min-width:0; }
   #qr { display:flex; justify-content:center; margin:8px 0; }
-  #qr img { width:220px; height:220px; image-rendering:pixelated; }
+  #qr img { width:min(300px, 80vw); height:auto; image-rendering:pixelated; }
   .big { font-size:28px; font-weight:700; letter-spacing:4px; text-align:center; }
   .status { font-weight:700; }
   .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
@@ -33,7 +33,7 @@
 <body>
 <main>
   <h1>애플망고 연결 테스트</h1>
-  <p class="sub">PC와 폰을 서버 저장 없이 직접 연결할 수 있는지 확인합니다. 가짜 데이터만 오갑니다. <b>버전 6</b></p>
+  <p class="sub">PC와 폰을 서버 저장 없이 직접 연결할 수 있는지 확인합니다. 가짜 데이터만 오갑니다. <b>버전 7</b></p>
 
   <div class="card" id="startCard">
     <div class="row">
@@ -44,6 +44,11 @@
       <input id="joinCode" inputmode="numeric" placeholder="PC에 보이는 6자리 코드">
       <button id="btnJoin">연결</button>
     </div>
+    <details style="margin-top:12px">
+      <summary>중계 서버 설정 (PC에서만, 선택)</summary>
+      <textarea id="iceInput" placeholder='Cloudflare가 준 {"iceServers": ...} 결과를 그대로 붙여 넣기' style="margin-top:8px"></textarea>
+      <label style="display:block;margin-top:6px"><input type="checkbox" id="relayOnly"> 중계만 쓰기 (직접 연결 시도 안 함)</label>
+    </details>
   </div>
 
   <div class="card hide" id="qrCard">
@@ -116,6 +121,7 @@ function renderInfo() {
     ['기기', /Mobi|Android|iPhone/.test(navigator.userAgent) ? '모바일' : 'PC'],
     ['네트워크', netInfo()],
     ['연결까지 걸린 시간', stats.connectMs != null ? (stats.connectMs / 1000).toFixed(1) + '초' : '-'],
+    ['중계 설정', turnLabel()],
     ['연결 경로', stats.path],
     ['같은 망인가', stats.sameNet],
     ['응답 시간(평균)', avg != null ? avg + 'ms' : '-'],
@@ -132,11 +138,12 @@ function updateSummary() {
     `연결 시간: ${stats.connectMs != null ? stats.connectMs + 'ms' : '-'}`,
     `경로: ${stats.path} (local ${stats.pathLocal}, remote ${stats.pathRemote})`,
     `같은 망인가: ${stats.sameNet}`,
+    `중계 설정: ${turnLabel()}`,
     `RTT 평균: ${avg ?? '-'}ms, 측정 ${stats.rtts.length}회, 최대 ${stats.rtts.length ? Math.max(...stats.rtts) : '-'}ms`,
     `끊김 ${stats.disconnects}, 재연결 ${stats.reconnects}`,
     `대량 전송: ${stats.bulk.join(' | ') || '-'}`,
     `UA: ${navigator.userAgent}`,
-    '페이지 버전: 6',
+    '페이지 버전: 7',
     '--- 기록 (최근 40줄)',
     ...$('log').textContent.trim().split('\n').slice(-40),
   ].join('\n');
@@ -261,8 +268,26 @@ function scheduleRetry() {
   }, 2000);
 }
 
+// 중계(TURN) 설정. PC에서 붙여 넣으면 QR 주소의 # 뒤에 실려 폰에도 전달된다(서버로는 안 감).
+let turn = { servers: [], relayOnly: false };
+function parseIce(text) {
+  const j = JSON.parse(text);
+  const raw = j.iceServers ?? j;
+  const list = (Array.isArray(raw) ? raw : [raw]).filter((x) => x && x.urls);
+  if (!list.length) throw new Error('iceServers가 없음');
+  return list;
+}
+const b64 = (o) => btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64 = (t) => JSON.parse(atob(t.replace(/-/g, '+').replace(/_/g, '/')));
+function iceConfig() {
+  return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, ...turn.servers], iceTransportPolicy: turn.relayOnly ? 'relay' : 'all' };
+}
+function turnLabel() {
+  return turn.servers.length ? (turn.relayOnly ? '있음 (중계만 쓰기)' : '있음 (직접 먼저, 안 되면 중계)') : '없음 (직접 연결만)';
+}
+
 function newPeer(id) {
-  const p = new Peer(id, { debug: 1 });
+  const p = new Peer(id, { debug: 1, config: iceConfig() });
   p.on('disconnected', () => { log('중개 서버와 연결 끊김 → 다시 붙는 중'); setTimeout(() => !p.destroyed && p.reconnect(), 1500); });
   p.on('error', (e) => {
     log('오류: ' + e.type + ' ' + (e.message || ''));
@@ -274,14 +299,19 @@ function newPeer(id) {
 }
 
 function host() {
+  const iceText = $('iceInput').value.trim();
+  if (iceText) {
+    try { turn = { servers: parseIce(iceText), relayOnly: $('relayOnly').checked }; log('중계 설정 읽음: 서버 ' + turn.servers.length + '개'); }
+    catch (e) { log('중계 설정을 읽지 못함: ' + e.message); return; }
+  }
   role = 'host';
   code = String(Math.floor(100000 + Math.random() * 900000));
   peer = newPeer(PREFIX + code);
   setStatus('중개 서버 연결 중');
   peer.on('open', () => {
-    const url = location.origin + location.pathname + '?join=' + code;
-    const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
-    $('qr').innerHTML = qr.createImgTag(6, 8);
+    const url = location.origin + location.pathname + '?join=' + code + (turn.servers.length ? '#t=' + b64({ s: turn.servers, r: turn.relayOnly }) : '');
+    const qr = qrcode(0, 'L'); qr.addData(url); qr.make();
+    $('qr').innerHTML = qr.createImgTag(turn.servers.length ? 3 : 6, 8);
     $('codeText').textContent = code;
     $('qrCard').classList.remove('hide'); $('startCard').classList.add('hide');
     setStatus('폰을 기다리는 중'); log('QR 준비됨: ' + url);
@@ -333,6 +363,8 @@ $('btnSend').onclick = () => {
 };
 $('btnCopy').onclick = async () => { try { await navigator.clipboard.writeText($('summary').value); log('요약을 복사함'); } catch (e) { $('summary').select(); } };
 
+const h = location.hash.match(/t=([\w-]+)/);
+if (h) { try { const o = unb64(h[1]); turn = { servers: o.s, relayOnly: !!o.r }; history.replaceState(null, '', location.pathname + location.search); } catch (e) { log('QR의 중계 설정을 읽지 못함'); } }
 const q = new URLSearchParams(location.search).get('join');
 if (q && /^\d{6}$/.test(q)) join(q);
 updateSummary();
