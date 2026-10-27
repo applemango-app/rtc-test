@@ -33,7 +33,7 @@
 <body>
 <main>
   <h1>애플망고 연결 테스트</h1>
-  <p class="sub">PC와 폰을 서버 저장 없이 직접 연결할 수 있는지 확인합니다. 가짜 데이터만 오갑니다. <b>버전 7</b></p>
+  <p class="sub">PC와 폰을 서버 저장 없이 직접 연결할 수 있는지 확인합니다. 가짜 데이터만 오갑니다. <b>버전 8</b></p>
 
   <div class="card" id="startCard">
     <div class="row">
@@ -143,7 +143,7 @@ function updateSummary() {
     `끊김 ${stats.disconnects}, 재연결 ${stats.reconnects}`,
     `대량 전송: ${stats.bulk.join(' | ') || '-'}`,
     `UA: ${navigator.userAgent}`,
-    '페이지 버전: 7',
+    '페이지 버전: 8',
     '--- 기록 (최근 40줄)',
     ...$('log').textContent.trim().split('\n').slice(-40),
   ].join('\n');
@@ -271,11 +271,27 @@ function scheduleRetry() {
 // 중계(TURN) 설정. PC에서 붙여 넣으면 QR 주소의 # 뒤에 실려 폰에도 전달된다(서버로는 안 감).
 let turn = { servers: [], relayOnly: false };
 function parseIce(text) {
-  const j = JSON.parse(text);
+  let j;
+  try { j = JSON.parse(text); } catch (e) { j = looseIce(text); }
   const raw = j.iceServers ?? j;
   const list = (Array.isArray(raw) ? raw : [raw]).filter((x) => x && x.urls);
   if (!list.length) throw new Error('iceServers가 없음');
   return list;
+}
+// Metered 대시보드처럼 JSON이 아닌 자바스크립트 코드 조각을 붙여 넣은 경우: { urls: "...", username: "...", credential: "..." } 묶음을 하나씩 뽑는다.
+function looseIce(text) {
+  const out = [];
+  for (const m of text.matchAll(/\{[^{}]*\}/g)) {
+    const urls = [...m[0].matchAll(/["'`]((?:stuns?|turns?):[^"'`]+)["'`]/g)].map((x) => x[1]);
+    if (!urls.length) continue;
+    const pick = (k) => (m[0].match(new RegExp(k + String.raw`\s*:\s*["'\x60]([^"'\x60]+)`)) || [])[1];
+    const o = { urls: urls.length === 1 ? urls[0] : urls };
+    if (pick('username')) o.username = pick('username');
+    if (pick('credential')) o.credential = pick('credential');
+    out.push(o);
+  }
+  if (!out.length) throw new Error('붙여 넣은 내용에서 서버 주소를 찾지 못함');
+  return out;
 }
 const b64 = (o) => btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64 = (t) => JSON.parse(atob(t.replace(/-/g, '+').replace(/_/g, '/')));
