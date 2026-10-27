@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>애플망고 연결 테스트</title>
+<style>
+  :root { --bg:#fffaf3; --card:#fff; --ink:#2b2b2b; --muted:#777; --line:#eadfce; --pri:#e8892b; --ok:#2e8b57; --bad:#c0392b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Malgun Gothic",sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:8px 0 4px; }
+  .sub { color:var(--muted); font-size:14px; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--pri); background:var(--pri); color:#fff; cursor:pointer; }
+  button.sec { background:#fff; color:var(--pri); }
+  button:disabled { opacity:.4; cursor:default; }
+  input { font:inherit; padding:9px 10px; border:1px solid var(--line); border-radius:8px; flex:1; min-width:0; }
+  #qr { display:flex; justify-content:center; margin:8px 0; }
+  #qr img { width:220px; height:220px; image-rendering:pixelated; }
+  .big { font-size:28px; font-weight:700; letter-spacing:4px; text-align:center; }
+  .status { font-weight:700; }
+  .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td { padding:4px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  td:first-child { color:var(--muted); width:42%; }
+  #log { font:12px/1.4 ui-monospace,Consolas,monospace; background:#faf6ef; border-radius:8px; padding:8px; height:180px; overflow:auto; white-space:pre-wrap; }
+  .hide { display:none; }
+  textarea { width:100%; height:120px; font:12px ui-monospace,Consolas,monospace; border:1px solid var(--line); border-radius:8px; padding:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>애플망고 연결 테스트</h1>
+  <p class="sub">PC와 폰을 서버 저장 없이 직접 연결할 수 있는지 확인합니다. 가짜 데이터만 오갑니다.</p>
+
+  <div class="card" id="startCard">
+    <div class="row">
+      <button id="btnHost">PC: 연결 QR 만들기</button>
+      <button class="sec" id="btnJoinShow">폰: 코드로 연결</button>
+    </div>
+    <div class="row hide" id="joinRow" style="margin-top:10px">
+      <input id="joinCode" inputmode="numeric" placeholder="PC에 보이는 6자리 코드">
+      <button id="btnJoin">연결</button>
+    </div>
+  </div>
+
+  <div class="card hide" id="qrCard">
+    <div>폰 카메라로 QR을 찍으세요.</div>
+    <div id="qr"></div>
+    <div class="big" id="codeText"></div>
+  </div>
+
+  <div class="card">
+    <div>상태: <span class="status" id="status">대기</span></div>
+    <table id="info" style="margin-top:8px"></table>
+  </div>
+
+  <div class="card hide" id="actCard">
+    <div class="row">
+      <button id="btnBulk">가짜 기록 100건 보내기</button>
+      <button class="sec" id="btnBig">긴 문구 300건 보내기</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="msg" placeholder="메시지">
+      <button class="sec" id="btnSend">보내기</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:6px">기록</div>
+    <div id="log"></div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:6px">결과 요약 (복사해서 Claude에게 붙여 주세요)</div>
+    <textarea id="summary" readonly></textarea>
+    <div class="row" style="margin-top:8px"><button class="sec" id="btnCopy">요약 복사</button></div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script>
+const PREFIX = 'applemango-rtc-test-';
+const $ = (id) => document.getElementById(id);
+const t0 = performance.now();
+let peer = null, conn = null, role = null, code = null;
+let connectStartedAt = 0, retryTimer = null, pingTimer = null, wakeLock = null;
+const stats = { connectMs: null, pathLocal: '-', pathRemote: '-', path: '-', rtts: [], reconnects: 0, disconnects: 0, bulk: [] };
+const pending = new Map();
+
+function log(s) {
+  const el = $('log');
+  el.textContent += `[${((performance.now() - t0) / 1000).toFixed(1)}s] ${s}\n`;
+  el.scrollTop = el.scrollHeight;
+  updateSummary();
+}
+function setStatus(s, cls) { const el = $('status'); el.textContent = s; el.className = 'status ' + (cls || ''); updateSummary(); }
+
+function netInfo() {
+  const c = navigator.connection;
+  return c ? `${c.type || '?'} / ${c.effectiveType || '?'}` : '알 수 없음';
+}
+const PATH_LABEL = {
+  host: '같은 네트워크 안에서 직접',
+  srflx: '인터넷을 거쳐 직접 (공유기 통과)',
+  prflx: '인터넷을 거쳐 직접 (공유기 통과)',
+  relay: '중계 서버 경유',
+};
+function renderInfo() {
+  const avg = stats.rtts.length ? Math.round(stats.rtts.reduce((a, b) => a + b, 0) / stats.rtts.length) : null;
+  const rows = [
+    ['역할', role === 'host' ? 'PC (QR 만든 쪽)' : role === 'join' ? '폰 (QR 찍은 쪽)' : '-'],
+    ['기기', /Mobi|Android|iPhone/.test(navigator.userAgent) ? '모바일' : 'PC'],
+    ['네트워크', netInfo()],
+    ['연결까지 걸린 시간', stats.connectMs != null ? (stats.connectMs / 1000).toFixed(1) + '초' : '-'],
+    ['연결 경로', stats.path],
+    ['응답 시간(평균)', avg != null ? avg + 'ms' : '-'],
+    ['끊김 / 재연결', `${stats.disconnects} / ${stats.reconnects}`],
+  ];
+  $('info').innerHTML = rows.map(([a, b]) => `<tr><td>${a}</td><td>${b}</td></tr>`).join('');
+}
+function updateSummary() {
+  renderInfo();
+  const avg = stats.rtts.length ? Math.round(stats.rtts.reduce((a, b) => a + b, 0) / stats.rtts.length) : null;
+  $('summary').value = [
+    `역할: ${role || '-'} / 기기: ${/Mobi|Android|iPhone/.test(navigator.userAgent) ? 'mobile' : 'pc'} / 네트워크: ${netInfo()}`,
+    `상태: ${$('status').textContent}`,
+    `연결 시간: ${stats.connectMs != null ? stats.connectMs + 'ms' : '-'}`,
+    `경로: ${stats.path} (local ${stats.pathLocal}, remote ${stats.pathRemote})`,
+    `RTT 평균: ${avg ?? '-'}ms, 측정 ${stats.rtts.length}회, 최대 ${stats.rtts.length ? Math.max(...stats.rtts) : '-'}ms`,
+    `끊김 ${stats.disconnects}, 재연결 ${stats.reconnects}`,
+    `대량 전송: ${stats.bulk.join(' | ') || '-'}`,
+    `UA: ${navigator.userAgent}`,
+  ].join('\n');
+}
+
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); } } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  log(document.visibilityState === 'visible' ? '화면으로 돌아옴' : '화면을 벗어남(백그라운드)');
+  if (document.visibilityState === 'visible' && conn) keepAwake();
+});
+
+async function readPath() {
+  if (!conn || !conn.peerConnection) return;
+  try {
+    const rep = await conn.peerConnection.getStats();
+    let pair = null; const byId = {};
+    rep.forEach((r) => { byId[r.id] = r; });
+    rep.forEach((r) => {
+      if (r.type === 'transport' && r.selectedCandidatePairId) pair = byId[r.selectedCandidatePairId];
+    });
+    if (!pair) rep.forEach((r) => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r; });
+    if (!pair) return;
+    const l = byId[pair.localCandidateId], r = byId[pair.remoteCandidateId];
+    stats.pathLocal = l ? `${l.candidateType}/${l.protocol}` : '?';
+    stats.pathRemote = r ? `${r.candidateType}/${r.protocol}` : '?';
+    const types = [l && l.candidateType, r && r.candidateType];
+    const key = types.includes('relay') ? 'relay' : types.every((x) => x === 'host') ? 'host' : 'srflx';
+    stats.path = PATH_LABEL[key];
+    updateSummary();
+  } catch (e) { log('경로 확인 실패: ' + e.message); }
+}
+
+function fakeRecords(n, long) {
+  const areas = ['수학', '국어', '사회', '과학', '생활'];
+  const text = long
+    ? '수업 시간에 친구의 의견을 끝까지 듣고 자신의 생각을 덧붙여 말하며, 모둠 활동에서 역할을 나누어 맡아 끝까지 책임감 있게 해냄. '.repeat(3)
+    : '발표에 적극 참여함';
+  return Array.from({ length: n }, (_, i) => ({ id: i + 1, student: `학생${(i % 25) + 1}`, area: areas[i % 5], level: ['잘함', '보통', '노력요함'][i % 3], memo: text, at: Date.now() }));
+}
+
+function wire(c) {
+  conn = c;
+  c.on('open', () => {
+    stats.connectMs = Math.round(performance.now() - connectStartedAt);
+    if (stats.disconnects > 0) stats.reconnects++;
+    setStatus('연결됨', 'ok');
+    log(`연결됨 (${(stats.connectMs / 1000).toFixed(1)}초)`);
+    $('actCard').classList.remove('hide');
+    $('qrCard').classList.add('hide');
+    keepAwake();
+    setTimeout(readPath, 500); setTimeout(readPath, 3000);
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => { if (conn && conn.open) conn.send({ t: 'ping', at: performance.now() }); }, 2000);
+  });
+  c.on('data', (m) => {
+    if (m.t === 'ping') return c.send({ t: 'pong', at: m.at });
+    if (m.t === 'pong') { stats.rtts.push(Math.round(performance.now() - m.at)); if (stats.rtts.length > 300) stats.rtts.shift(); return updateSummary(); }
+    if (m.t === 'msg') return log('받음: ' + m.text);
+    if (m.t === 'bulk') {
+      c.send({ t: 'ack', id: m.id, n: m.records.length, bytes: JSON.stringify(m.records).length });
+      return log(`가짜 기록 ${m.records.length}건 받음 → 저장했다고 답장`);
+    }
+    if (m.t === 'ack') {
+      const p = pending.get(m.id); if (!p) return;
+      pending.delete(m.id);
+      const ms = Math.round(performance.now() - p.at);
+      const r = `${m.n}건 ${Math.round(m.bytes / 1024)}KB ${ms}ms`;
+      stats.bulk.push(r); log('상대가 받았다고 확인: ' + r);
+    }
+  });
+  c.on('close', () => { if (c === conn) onLost(); });
+  c.on('error', (e) => log('연결 오류: ' + e.type + ' ' + e.message));
+  if (c.peerConnection) {
+    c.peerConnection.addEventListener('iceconnectionstatechange', () => {
+      const s = c.peerConnection.iceConnectionState;
+      log('ICE: ' + s);
+      if (s === 'failed') setStatus('직접 연결 실패 (중계 서버 필요)', 'bad');
+    });
+  }
+}
+
+function onLost() {
+  if (!conn) return;
+  conn = null; stats.disconnects++;
+  clearInterval(pingTimer);
+  setStatus('끊김', 'bad'); log('연결이 끊김');
+  if (pending.size) log(`확인 못 받은 전송 ${pending.size}건 (다시 연결되면 다시 보내야 함)`);
+  if (role === 'join') scheduleRetry();
+  else setStatus('끊김 — 폰이 다시 연결하길 기다림', 'bad');
+}
+
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    if (conn && conn.open) return;
+    log('다시 연결 시도');
+    if (peer.disconnected) peer.reconnect();
+    connectStartedAt = performance.now();
+    wire(peer.connect(PREFIX + code, { reliable: true }));
+    setTimeout(() => { if (!conn || !conn.open) scheduleRetry(); }, 8000);
+  }, 2000);
+}
+
+function newPeer(id) {
+  const p = new Peer(id, { debug: 1 });
+  p.on('disconnected', () => { log('중개 서버와 연결 끊김 → 다시 붙는 중'); setTimeout(() => !p.destroyed && p.reconnect(), 1500); });
+  p.on('error', (e) => {
+    log('오류: ' + e.type + ' ' + (e.message || ''));
+    if (e.type === 'unavailable-id' && role === 'host') { p.destroy(); host(); }
+    if (e.type === 'peer-unavailable') { setStatus('PC를 찾을 수 없음 (코드 확인)', 'bad'); if (role === 'join') scheduleRetry(); }
+    if (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error') setStatus('중개 서버 접속 실패', 'bad');
+  });
+  return p;
+}
+
+function host() {
+  role = 'host';
+  code = String(Math.floor(100000 + Math.random() * 900000));
+  peer = newPeer(PREFIX + code);
+  setStatus('중개 서버 연결 중');
+  peer.on('open', () => {
+    const url = location.origin + location.pathname + '?join=' + code;
+    const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
+    $('qr').innerHTML = qr.createImgTag(6, 8);
+    $('codeText').textContent = code;
+    $('qrCard').classList.remove('hide'); $('startCard').classList.add('hide');
+    setStatus('폰을 기다리는 중'); log('QR 준비됨: ' + url);
+    connectStartedAt = performance.now();
+  });
+  peer.on('connection', (c) => {
+    if (conn && conn.open) { log('이미 연결되어 있어 새 연결을 거절'); c.on('open', () => c.close()); return; }
+    connectStartedAt = performance.now();
+    log('폰이 연결을 시도함'); wire(c);
+  });
+}
+
+function join(c) {
+  role = 'join'; code = c;
+  $('startCard').classList.add('hide');
+  peer = newPeer();
+  setStatus('중개 서버 연결 중');
+  peer.on('open', () => {
+    setStatus('PC에 연결 중'); log('PC에 연결 시도 (코드 ' + code + ')');
+    connectStartedAt = performance.now();
+    wire(peer.connect(PREFIX + code, { reliable: true }));
+    setTimeout(() => { if (!conn || !conn.open) { log('15초 안에 연결 안 됨'); if ($('status').textContent === 'PC에 연결 중') setStatus('연결 안 됨 (15초)', 'bad'); } }, 15000);
+  });
+}
+
+function sendBulk(n, long) {
+  if (!conn || !conn.open) return log('연결되어 있지 않음');
+  const id = Math.random().toString(36).slice(2);
+  pending.set(id, { at: performance.now() });
+  conn.send({ t: 'bulk', id, records: fakeRecords(n, long) });
+  log(`가짜 기록 ${n}건 보냄`);
+}
+
+$('btnHost').onclick = host;
+$('btnJoinShow').onclick = () => $('joinRow').classList.toggle('hide');
+$('btnJoin').onclick = () => { const v = $('joinCode').value.trim(); if (/^\d{6}$/.test(v)) join(v); };
+$('btnBulk').onclick = () => sendBulk(100, false);
+$('btnBig').onclick = () => sendBulk(300, true);
+$('btnSend').onclick = () => { const v = $('msg').value.trim(); if (v && conn && conn.open) { conn.send({ t: 'msg', text: v }); log('보냄: ' + v); $('msg').value = ''; } };
+$('btnCopy').onclick = async () => { try { await navigator.clipboard.writeText($('summary').value); log('요약을 복사함'); } catch (e) { $('summary').select(); } };
+
+const q = new URLSearchParams(location.search).get('join');
+if (q && /^\d{6}$/.test(q)) join(q);
+updateSummary();
+</script>
+</body>
+</html>
