@@ -210,6 +210,7 @@ function wire(c) {
     c.peerConnection.addEventListener('iceconnectionstatechange', () => {
       const s = c.peerConnection.iceConnectionState;
       log('ICE: ' + s);
+      if (s === 'checking') setStatus('연결 경로 찾는 중');
       if (s === 'failed') setStatus('직접 연결 실패 (중계 서버 필요)', 'bad');
     });
   }
@@ -266,6 +267,7 @@ function host() {
   peer.on('connection', (c) => {
     if (conn && conn.open) { log('이미 연결되어 있어 새 연결을 거절'); c.on('open', () => c.close()); return; }
     connectStartedAt = performance.now();
+    setStatus('폰과 연결 중 (경로 찾는 중)');
     log('폰이 연결을 시도함'); wire(c);
   });
 }
@@ -279,7 +281,7 @@ function join(c) {
     setStatus('PC에 연결 중'); log('PC에 연결 시도 (코드 ' + code + ')');
     connectStartedAt = performance.now();
     wire(peer.connect(PREFIX + code, { reliable: true }));
-    setTimeout(() => { if (!conn || !conn.open) { log('15초 안에 연결 안 됨'); if ($('status').textContent === 'PC에 연결 중') setStatus('연결 안 됨 (15초)', 'bad'); } }, 15000);
+    setTimeout(() => { if (!conn || !conn.open) { log('15초 안에 연결 안 됨'); const st = $('status').textContent; setStatus(st === 'PC에 연결 중' ? 'PC가 응답 없음 (15초) — 코드나 PC 화면 확인' : '연결 안 됨 (15초) — 경로를 못 찾음, 중계 서버 필요 가능성', 'bad'); } }, 15000);
   });
 }
 
